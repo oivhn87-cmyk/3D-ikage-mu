@@ -1,0 +1,321 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>3D オンライン イカゲーム</title>
+    <!-- Three.js (3D用) -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+    <!-- PeerJS (ブラウザ同士を直接つなぐオンライン通信用) -->
+    <script src="https://unpkg.com/peerjs@1.5.2/dist/peerjs.min.js"></script>
+    <style>
+        body {
+            margin: 0; overflow: hidden; background-color: #0b0b0b;
+            font-family: 'Arial', sans-serif; user-select: none; touch-action: manipulation;
+        }
+        #ui {
+            position: absolute; top: 15px; left: 50%; transform: translateX(-50%);
+            color: #fff; text-align: center; pointer-events: none;
+            text-shadow: 0 2px 6px rgba(0,0,0,0.9); width: 90%; z-index: 10;
+        }
+        h1 { margin: 0 0 5px 0; font-size: 18px; color: #ff0055; }
+        #status { font-size: 15px; font-weight: bold; color: #ffcc00; }
+        #room-info { font-size: 12px; margin-top: 3px; color: #00ff66; word-break: break-all; pointer-events: auto; }
+        
+        /* 矢印ボタン・操作パネル */
+        #controls-container {
+            position: absolute; bottom: 30px; left: 50%; transform: translateX(-50%);
+            display: flex; flex-direction: column; align-items: center; gap: 10px; z-index: 10;
+            width: 100%; max-width: 300px;
+        }
+        .control-row {
+            display: flex; gap: 15px; justify-content: center; width: 100%;
+        }
+        .arrow-btn {
+            width: 80px; height: 60px; font-size: 24px; font-weight: bold;
+            background: rgba(255, 0, 85, 0.8); color: white; border: 2px solid #fff; border-radius: 12px;
+            cursor: pointer; box-shadow: 0 4px 10px rgba(0,0,0,0.5);
+            display: flex; justify-content: center; align-items: center;
+        }
+        .arrow-btn:active { background: rgba(200, 0, 60, 1); transform: scale(0.95); }
+        .arrow-btn:disabled { background: #555; border-color: #333; cursor: not-allowed; }
+        
+        #room-input-container {
+            position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%);
+            background: rgba(20, 20, 25, 0.95); padding: 25px; border-radius: 15px; border: 2px solid #ff0055;
+            text-align: center; z-index: 100; color: white; width: 85%; max-width: 350px;
+        }
+        input { padding: 10px; font-size: 16px; width: 80%; margin: 10px 0; border-radius: 5px; border: none; text-align: center; }
+        .menu-btn { padding: 12px 20px; font-size: 16px; font-weight: bold; background: #ff0055; color: white; border: none; border-radius: 8px; cursor: pointer; }
+    </style>
+</head>
+<body>
+
+    <!-- ルーム参加メニュー（オンライン接続用） -->
+    <div id="room-input-container">
+        <h2 style="color:#ff0055; margin-top:0;">3D イカゲーム オンライン</h2>
+        <p style="font-size: 13px;">友達と同じルーム名を入力して「接続」を押してください。<br>(一人でテストする場合はそのまま接続)</p>
+        <input type="text" id="room-name-input" value="ika-game-room-123" placeholder="ルーム名">
+        <br>
+        <button class="menu-btn" onclick="joinOnlineGame()">オンライン接続する</button>
+    </div>
+
+    <div id="ui">
+        <h1>3D オンライン イカゲーム</h1>
+        <div id="status">ルームに接続してください</div>
+        <div id="room-info"></div>
+    </div>
+
+    <!-- 矢印ボタン類 -->
+    <div id="controls-container">
+        <div class="control-row">
+            <button class="arrow-btn" id="btn-up" onclick="movePlayerForward()">▲<br>進む</button>
+        </div>
+        <div class="control-row">
+            <button class="arrow-btn" id="btn-left" onclick="movePlayerLeft()" style="display:none;">◀<br>左</button>
+            <button class="arrow-btn" id="btn-right" onclick="movePlayerRight()" style="display:none;">▶<br>右</button>
+        </div>
+    </div>
+
+    <script>
+        let scene, camera, renderer;
+        let peer, conn, isHost = false;
+        let myId = null;
+        let myStage = 1; // 1: だるまさんがころんだ, 2: ガラスの橋
+        let isAlive = true;
+        
+        let players = {}; // 全プレイヤーの位置情報
+        let doll, isRedLight = false;
+        let dollTimer;
+
+        // ガラス橋用変数
+        let bridgeSteps = 5;
+        let safePath = [];
+        let currentBridgeStep = -1;
+        let glassObjects = [];
+
+        function init3D() {
+            scene = new THREE.Scene();
+            scene.background = new THREE.Color(0x111115);
+            scene.fog = new THREE.Fog(0x111115, 20, 60);
+
+            camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.1, 1000);
+            
+            renderer = new THREE.WebGLRenderer({ antialias: true });
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            renderer.shadowMap.enabled = true;
+            document.body.appendChild(renderer.domElement);
+
+            scene.add(new THREE.AmbientLight(0xffffff, 0.6));
+            const dirLight = new THREE.DirectionalLight(0xffffff, 0.8);
+            dirLight.position.set(10, 20, 10);
+            scene.add(dirLight);
+
+            setupStage1World();
+            animate();
+        }
+
+        // --- ステージ1 ワールド構築 ---
+        function setupStage1World() {
+            // 地面
+            const ground = new THREE.Mesh(new THREE.PlaneGeometry(10, 60), new THREE.MeshStandardMaterial({ color: 0x333333 }));
+            ground.rotation.x = -Math.PI / 2;
+            scene.add(ground);
+
+            // ゴールライン
+            const finishLine = new THREE.Mesh(new THREE.BoxGeometry(10, 0.1, 0.5), new THREE.MeshStandardMaterial({ color: 0xff0055 }));
+            finishLine.position.set(0, 0.05, -22);
+            scene.add(finishLine);
+
+            // 鬼（ドール）
+            const dollGroup = new THREE.Group();
+            const head = new THREE.Mesh(new THREE.SphereGeometry(0.5, 16, 16), new THREE.MeshStandardMaterial({ color: 0xffcc00 }));
+            head.position.y = 2.5;
+            const body = new THREE.Mesh(new THREE.CylinderGeometry(0.4, 0.6, 1.5, 16), new THREE.MeshStandardMaterial({ color: 0xff4444 }));
+            body.position.y = 1.5;
+            dollGroup.add(head); dollGroup.add(body);
+            dollGroup.position.set(0, 0, -25);
+            scene.add(dollGroup);
+            doll = dollGroup;
+
+            camera.position.set(0, 4, 32);
+            camera.lookAt(0, 1, 20);
+        }
+
+        // 3Dプレイヤー（緑ジャージ＋白い襟）作成
+        function createPlayerMesh(id, isMe) {
+            const group = new THREE.Group();
+            const bodyMat = new THREE.MeshStandardMaterial({ color: isMe ? 0x00a859 : 0x005f33 });
+            const body = new THREE.Mesh(new THREE.BoxGeometry(0.8, 1.2, 0.6), bodyMat);
+            body.position.y = 0.6;
+            group.add(body);
+
+            const collar = new THREE.Mesh(new THREE.BoxGeometry(0.5, 0.15, 0.65), new THREE.MeshStandardMaterial({ color: 0xffffff }));
+            collar.position.set(0, 1.2, 0);
+            group.add(collar);
+
+            group.position.set(isMe ? 0 : (Math.random() * 2 - 1), 0, 25);
+            scene.add(group);
+            players[id] = { mesh: group, z: 25, x: group.position.x, stage: 1, alive: true };
+        }
+
+        // --- オンライン接続 (PeerJS) ---
+        function joinOnlineGame() {
+            const roomName = document.getElementById('room-name-input').value.trim();
+            if (!roomName) return alert("ルーム名を入力してください");
+
+            document.getElementById('room-input-container').style.display = 'none';
+            document.getElementById('status').textContent = "オンライン接続中...";
+
+            // 無料のピアサーバーで接続
+            peer = new Peer('ika-game-' + roomName);
+
+            peer.on('open', (id) => {
+                myId = id;
+                isHost = true; // 最初にルームを作った人がホスト
+                document.getElementById('status').textContent = "ホストとして接続完了！";
+                document.getElementById('room-info').textContent = "ルーム: " + roomName;
+                init3D();
+                createPlayerMesh(myId, true);
+                startHostDollLoop();
+            });
+
+            peer.on('error', (err) => {
+                // すでにホストが存在する場合はゲストとして接続
+                connectAsGuest(roomName);
+            });
+        }
+
+        function connectAsGuest(roomName) {
+            peer = new Peer();
+            peer.on('open', (id) => {
+                myId = id;
+                isHost = false;
+                document.getElementById('status').textContent = "ゲストとして接続中...";
+                document.getElementById('room-info').textContent = "ルーム: " + roomName;
+                
+                init3D();
+                createPlayerMesh(myId, true);
+
+                // ホストに接続を試みる
+                conn = peer.connect('ika-game-' + roomName);
+                setupConnectionEvents();
+            });
+        }
+
+        function setupConnectionEvents() {
+            conn.on('open', () => {
+                document.getElementById('status').textContent = "対戦相手と接続しました！";
+                conn.send({ type: 'join', id: myId });
+            });
+            conn.on('data', (data) => handleNetworkData(data));
+        }
+
+        // ホスト側の通信受付
+        if (peer) {
+            // PeerJSの受信設定
+        }
+        // ※PeerJSの簡易接続ハンドラ
+        setTimeout(() => {
+            if(peer) {
+                peer.on('connection', (incomingConn) => {
+                    conn = incomingConn;
+                    setupConnectionEvents();
+                });
+            }
+        }, 1000);
+
+        function handleNetworkData(data) {
+            if (data.type === 'join') {
+                if (!players[data.id]) createPlayerMesh(data.id, false);
+            } else if (data.type === 'move') {
+                if (players[data.id]) {
+                    players[data.id].z = data.z;
+                    players[data.id].mesh.position.z = data.z;
+                    if(data.id === myId) camera.position.z = data.z + 7;
+                }
+            } else if (data.type === 'doll') {
+                updateDollVisual(data.isRed);
+            } else if (data.type === 'died') {
+                if (players[data.id]) {
+                    players[data.id].mesh.rotation.x = Math.PI / 2;
+                    players[data.id].alive = false;
+                }
+            }
+        }
+
+        function broadcast(data) {
+            if (conn && conn.open) conn.send(data);
+        }
+
+        // --- ホスト用：だるまさんがころんだの鬼の動き管理 ---
+        function startHostDollLoop() {
+            if (!isHost) return;
+            const interval = Math.random() * 2000 + 1500;
+            dollTimer = setTimeout(() => {
+                isRedLight = !isRedLight;
+                updateDollVisual(isRedLight);
+                broadcast({ type: 'doll', isRed: isRedLight });
+                startHostDollLoop();
+            }, interval);
+        }
+
+        function updateDollVisual(isRed) {
+            isRedLight = isRed;
+            if (isRed) {
+                doll.rotation.y = Math.PI;
+                document.getElementById('status').textContent = "赤信号：止まれ！！";
+                document.getElementById('status').style.color = "#ff0055";
+            } else {
+                doll.rotation.y = 0;
+                document.getElementById('status').textContent = "青信号：進め！";
+                document.getElementById('status').style.color = "#00ff66";
+            }
+        }
+
+        // --- プレイヤーの移動操作（矢印ボタン） ---
+        function movePlayerForward() {
+            if (!isAlive || myStage !== 1) return;
+
+            if (isRedLight) {
+                // 赤信号で動いた！死亡
+                isAlive = false;
+                document.getElementById('status').textContent = "赤信号で動きました！脱落...💥";
+                if (players[myId]) {
+                    players[myId].mesh.rotation.x = Math.PI / 2;
+                }
+                broadcast({ type: 'died', id: myId });
+                return;
+            }
+
+            if (players[myId]) {
+                players[myId].z -= 1.5;
+                players[myId].mesh.position.z = players[myId].z;
+                camera.position.z = players[myId].z + 7;
+                broadcast({ type: 'move', id: myId, z: players[myId].z });
+
+                // ゴール判定
+                if (players[myId].z <= -22) {
+                    document.getElementById('status').textContent = "ステージ1クリア！お見事！";
+                }
+            }
+        }
+
+        function movePlayerLeft() { /* ガラス橋用 */ }
+        function movePlayerRight() { /* ガラス橋用 */ }
+
+        // キーボードの矢印上キーやスペースキーでも前進できるようにする
+        window.addEventListener('keydown', (e) => {
+            if (e.code === 'ArrowUp' || e.code === 'Space') {
+                e.preventDefault();
+                movePlayerForward();
+            }
+        });
+
+        function animate() {
+            requestAnimationFrame(animate);
+            renderer.render(scene, camera);
+        }
+    </script>
+</body>
+</html>
